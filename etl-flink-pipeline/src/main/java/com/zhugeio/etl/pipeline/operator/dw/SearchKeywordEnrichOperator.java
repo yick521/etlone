@@ -3,9 +3,10 @@ package com.zhugeio.etl.pipeline.operator.dw;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.zhugeio.etl.common.client.kvrocks.KvrocksClient;
-import com.zhugeio.etl.common.model.kw.BaiduKeyword;
-import com.zhugeio.etl.common.util.kw.SearchKeywordParser;
-import com.zhugeio.etl.pipeline.example.ZGMessage;
+import com.zhugeio.etl.common.metrics.OperatorMetrics;
+import com.zhugeio.etl.common.model.BaiduKeyword;
+import com.zhugeio.etl.common.util.SearchKeywordParser;
+import com.zhugeio.etl.pipeline.entity.ZGMessage;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.async.ResultFuture;
 import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;
@@ -20,9 +21,6 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * 搜索关键词富化算子
- * 
- * 从 ZGMessage 的 referrer URL 中提取搜索引擎关键词
- * 双层缓存: L1 本地 Caffeine + L2 KVRocks
  */
 public class SearchKeywordEnrichOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
 
@@ -32,6 +30,9 @@ public class SearchKeywordEnrichOperator extends RichAsyncFunction<ZGMessage, ZG
     private transient SearchKeywordParser parser;
     private transient KvrocksClient kvrocksClient;
     private transient Cache<String, BaiduKeyword> localCache;
+
+    // ========== 新增: Metrics ==========
+    private transient OperatorMetrics metrics;
 
     private final String kvrocksHost;
     private final int kvrocksPort;
@@ -44,7 +45,7 @@ public class SearchKeywordEnrichOperator extends RichAsyncFunction<ZGMessage, ZG
     private transient long l3Hits;
 
     public SearchKeywordEnrichOperator(String kvrocksHost, int kvrocksPort, boolean isCluster,
-                                        int localCacheSize, long localCacheExpireMinutes) {
+                                       int localCacheSize, long localCacheExpireMinutes) {
         this.kvrocksHost = kvrocksHost;
         this.kvrocksPort = kvrocksPort;
         this.isCluster = isCluster;
@@ -54,12 +55,15 @@ public class SearchKeywordEnrichOperator extends RichAsyncFunction<ZGMessage, ZG
 
     @Override
     public void open(Configuration parameters) throws Exception {
+        // ========== 新增: 初始化 Metrics ==========
+        metrics = OperatorMetrics.create(getRuntimeContext().getMetricGroup(), "keyword_enrich");
+
         parser = new SearchKeywordParser();
 
         localCache = Caffeine.newBuilder()
-            .maximumSize(localCacheSize)
-            .expireAfterWrite(localCacheExpireMinutes, TimeUnit.MINUTES)
-            .build();
+                .maximumSize(localCacheSize)
+                .expireAfterWrite(localCacheExpireMinutes, TimeUnit.MINUTES)
+                .build();
 
         kvrocksClient = new KvrocksClient(kvrocksHost, kvrocksPort, isCluster);
         kvrocksClient.init();
@@ -72,69 +76,91 @@ public class SearchKeywordEnrichOperator extends RichAsyncFunction<ZGMessage, ZG
     @Override
     @SuppressWarnings("unchecked")
     public void asyncInvoke(ZGMessage message, ResultFuture<ZGMessage> resultFuture) throws Exception {
-        
+        // ========== 新增: 记录输入 ==========
+        metrics.in();
+
         Map<String, Object> data = message.getData();
         if (data == null) {
+            metrics.skip();  // 新增
             resultFuture.complete(Collections.singleton(message));
             return;
         }
 
         Object dataArrayObj = data.get("data");
         if (!(dataArrayObj instanceof List)) {
+            metrics.skip();  // 新增
             resultFuture.complete(Collections.singleton(message));
             return;
         }
 
         List<Map<String, Object>> dataList = (List<Map<String, Object>>) dataArrayObj;
 
-        // 处理每个 data 元素中的 $ref 字段
         CompletableFuture.runAsync(() -> {
-            for (Map<String, Object> dataItem : dataList) {
-                Object prObj = dataItem.get("pr");
-                if (!(prObj instanceof Map)) continue;
-                
-                Map<String, Object> pr = (Map<String, Object>) prObj;
-                String ref = getStringValue(pr, "$ref");
-                
-                if (ref == null || ref.isEmpty()) continue;
-
-                // L1 缓存查询
-                BaiduKeyword cached = localCache.getIfPresent(ref);
-                if (cached != null) {
-                    l1Hits++;
-                    applyKeyword(pr, cached);
-                    continue;
-                }
-
-                // L2 + L3: KVRocks 或实时解析
-                try {
-                    String cacheKey = "sk:" + ref;
-                    String kvValue = kvrocksClient.asyncGet(cacheKey).get(100, TimeUnit.MILLISECONDS);
-                    
-                    BaiduKeyword keyword;
-                    if (kvValue != null && !kvValue.isEmpty()) {
-                        l2Hits++;
-                        keyword = parseCacheValue(kvValue, ref);
-                    } else {
-                        l3Hits++;
-                        keyword = parser.parse(ref);
-                        if (keyword.isParsed()) {
-                            kvrocksClient.asyncSet(cacheKey, buildCacheValue(keyword));
-                        }
+            try {
+                for (Map<String, Object> dataItem : dataList) {
+                    Object prObj = dataItem.get("pr");
+                    if (!(prObj instanceof Map)) {
+                        continue;
                     }
-                    
-                    localCache.put(ref, keyword);
-                    applyKeyword(pr, keyword);
-                    
-                } catch (Exception e) {
-                    // 降级：直接解析
-                    l3Hits++;
-                    BaiduKeyword keyword = parser.parse(ref);
-                    localCache.put(ref, keyword);
-                    applyKeyword(pr, keyword);
+
+                    Map<String, Object> pr = (Map<String, Object>) prObj;
+                    String ref = getStringValue(pr, "$ref");
+
+                    if (ref == null || ref.isEmpty()) {
+                        continue;
+                    }
+
+                    // L1 缓存查询
+                    BaiduKeyword cached = localCache.getIfPresent(ref);
+                    if (cached != null) {
+                        l1Hits++;
+                        metrics.cacheHit();  // 新增
+                        applyKeyword(pr, cached);
+                        continue;
+                    }
+
+                    metrics.cacheMiss();  // 新增
+
+                    // L2 + L3: KVRocks 或实时解析
+                    try {
+                        String cacheKey = "sk:" + ref;
+                        String kvValue = kvrocksClient.asyncGet(cacheKey).get(100, TimeUnit.MILLISECONDS);
+
+                        BaiduKeyword keyword;
+                        if (kvValue != null && !kvValue.isEmpty()) {
+                            l2Hits++;
+                            keyword = parseCacheValue(kvValue, ref);
+                        } else {
+                            l3Hits++;
+                            keyword = parser.parse(ref);
+                            if (keyword.isParsed()) {
+                                kvrocksClient.asyncSet(cacheKey, buildCacheValue(keyword));
+                            }
+                        }
+
+                        localCache.put(ref, keyword);
+                        applyKeyword(pr, keyword);
+
+                    } catch (Exception e) {
+                        l3Hits++;
+                        BaiduKeyword keyword = parser.parse(ref);
+                        localCache.put(ref, keyword);
+                        applyKeyword(pr, keyword);
+                    }
                 }
+
+                metrics.out();  // 新增
+
+            } catch (Exception e) {
+                LOG.error("[关键词富化算子] 处理失败: {}", e.getMessage());
+                metrics.error();  // 新增
             }
-        }).whenComplete((r, t) -> resultFuture.complete(Collections.singleton(message)));
+        }).whenComplete((r, t) -> {
+            if (t != null) {
+                metrics.error();  // 新增
+            }
+            resultFuture.complete(Collections.singleton(message));
+        });
     }
 
     private void applyKeyword(Map<String, Object> pr, BaiduKeyword keyword) {
@@ -163,7 +189,14 @@ public class SearchKeywordEnrichOperator extends RichAsyncFunction<ZGMessage, ZG
 
     @Override
     public void close() throws Exception {
-        if (kvrocksClient != null) kvrocksClient.shutdown();
+        // ========== 新增: 打印 Metrics ==========
+        LOG.info("[关键词富化算子] Metrics: in={}, out={}, error={}, skip={}, cacheHitRate={}%",
+                metrics.getIn(), metrics.getOut(), metrics.getError(), metrics.getSkip(),
+                String.format("%.2f", metrics.getCacheHitRate()));
+
+        if (kvrocksClient != null) {
+            kvrocksClient.shutdown();
+        }
         LOG.info("[关键词富化算子] 统计: L1={}, L2={}, L3={}", l1Hits, l2Hits, l3Hits);
     }
 }

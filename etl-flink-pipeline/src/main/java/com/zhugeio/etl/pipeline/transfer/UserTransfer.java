@@ -1,6 +1,6 @@
 package com.zhugeio.etl.pipeline.transfer;
 
-import com.zhugeio.etl.common.model.output.UserRow;
+import com.zhugeio.etl.common.model.UserRow;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

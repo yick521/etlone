@@ -1,6 +1,6 @@
 package com.zhugeio.etl.pipeline.kafka;
 
-import com.zhugeio.etl.pipeline.example.ZGMessage;
+import com.zhugeio.etl.pipeline.entity.ZGMessage;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
 import org.apache.flink.util.Collector;

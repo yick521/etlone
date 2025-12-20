@@ -1,7 +1,7 @@
 package com.zhugeio.etl.pipeline.transfer;
 
-import com.zhugeio.etl.common.model.output.EventAttrRow;
-import com.zhugeio.etl.pipeline.service.EventAttrColumnService;
+import com.zhugeio.etl.common.cache.ConfigCacheService;
+import com.zhugeio.etl.common.model.EventAttrRow;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -9,11 +9,14 @@ import java.io.Serializable;
 import java.sql.Timestamp;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * 事件属性转换器
- * 
- * 处理的事件类型: evt, vtl, mkt, ss, se, abp
+ *
+ * 1. 批量收集所有需要查询的属性
+ * 2. 并行发起异步查询
+ * 3. 统一等待结果，只阻塞一次
  */
 public class EventAttrTransfer implements Serializable {
     
@@ -34,7 +37,7 @@ public class EventAttrTransfer implements Serializable {
     
     private final int expireSubDays;
     private final int expireAddDays;
-    private final EventAttrColumnService columnService;
+    private final ConfigCacheService configCacheService;
     private final int eventAttrLengthLimit;
     
     private Set<String> mktAttrs;
@@ -47,8 +50,8 @@ public class EventAttrTransfer implements Serializable {
     private static final ThreadLocal<SimpleDateFormat> YEAR_WEEK_FORMAT = 
             ThreadLocal.withInitial(() -> new SimpleDateFormat("YYYYww"));
     
-    public EventAttrTransfer(EventAttrColumnService columnService, int expireSubDays, int expireAddDays, int eventAttrLengthLimit) {
-        this.columnService = columnService;
+    public EventAttrTransfer(ConfigCacheService configCacheService, int expireSubDays, int expireAddDays, int eventAttrLengthLimit) {
+        this.configCacheService = configCacheService;
         this.expireSubDays = expireSubDays;
         this.expireAddDays = expireAddDays;
         this.eventAttrLengthLimit = eventAttrLengthLimit;
@@ -65,7 +68,7 @@ public class EventAttrTransfer implements Serializable {
     public void setAbpAttrs(Set<String> abpAttrs) { this.abpAttrs = abpAttrs; }
     
     /**
-     * 转换事件数据 (从 Map)
+     * 转换事件数据 (从 Map) - 优化版
      */
     public EventAttrRow transferFromMap(Integer appId, Integer platform, String dt, Map<String, Object> pr,
                                   String ip, String[] ipResult, String ua, Map<String, String> uaResult,
@@ -102,15 +105,102 @@ public class EventAttrTransfer implements Serializable {
         fillBasicFieldsFromMap(row, pr, platform, dt, ip, ipResult, ua, uaResult, 
                         business, eqidKeywords, realtime, timeComponents);
         
-        // 填充自定义属性
+        // 填充自定义属性 - 使用优化版批量查询
         if (CUSTOM_PROPERTY_DT.contains(dt)) {
-            fillCustomPropertiesFromMap(row, pr, dt, zgEid);
+            fillCustomPropertiesBatch(row, pr, dt, zgEid);
         }
         
         row.setEid(zgEid);
         row.setYw(getYearWeek(realtime));
         
         return row;
+    }
+    
+    /**
+     * ✅ 优化: 批量填充自定义属性
+     * 
+     * 优化前: 循环内每次都 .get() 阻塞
+     * 优化后: 
+     *   1. 先收集所有需要查询的 (zgEid, propId) 对
+     *   2. 批量发起异步查询
+     *   3. CompletableFuture.allOf() 统一等待
+     *   4. 处理结果
+     */
+    private void fillCustomPropertiesBatch(EventAttrRow row, Map<String, Object> pr, String dt, String zgEid) {
+        Set<String> attrSet = getAttrSet(dt);
+        
+        // Step 1: 收集所有需要查询的属性
+        List<CustomPropQuery> queries = new ArrayList<>();
+        
+        for (String key : pr.keySet()) {
+            boolean isCustomProp = false;
+            
+            if ("evt".equals(dt) && key.startsWith("_")) {
+                isCustomProp = true;
+            } else if (("mkt".equals(dt) || "abp".equals(dt)) && !key.startsWith("$") 
+                    && !attrSet.contains(key.replace("$", ""))) {
+                isCustomProp = true;
+            }
+            
+            if (isCustomProp) {
+                String propIdKey = "$zg_epid#" + key;
+                String propId = getStringValue(pr, propIdKey);
+                
+                if (!isNullOrEmpty(propId)) {
+                    queries.add(new CustomPropQuery(key, propId));
+                }
+            }
+        }
+        
+        if (queries.isEmpty()) {
+            return;
+        }
+        
+        // Step 2: 批量发起异步查询
+        List<CompletableFuture<Integer>> futures = new ArrayList<>(queries.size());
+        for (CustomPropQuery query : queries) {
+            futures.add(configCacheService.getEventAttrColumnIndex(zgEid, query.propId));
+        }
+        
+        // Step 3: 统一等待所有结果 (只阻塞一次!)
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        } catch (Exception e) {
+            LOG.warn("批量查询属性列索引失败: zgEid={}", zgEid, e);
+            return;
+        }
+        
+        // Step 4: 处理结果
+        for (int i = 0; i < queries.size(); i++) {
+            try {
+                Integer colIndex = futures.get(i).join();
+                
+                if (colIndex != null && colIndex >= 1 && colIndex <= 100) {
+                    CustomPropQuery query = queries.get(i);
+                    String propValue = ensureLength(getStringValue(pr, query.key), eventAttrLengthLimit);
+                    row.setCustomProperty(colIndex, propValue);
+                    
+                    String propTypeKey = "$zg_eptp#" + query.key;
+                    String propType = ensureLength(getStringValue(pr, propTypeKey), 256);
+                    row.setPropertyType(colIndex, propType);
+                }
+            } catch (Exception e) {
+                // 单个查询失败不影响其他
+            }
+        }
+    }
+    
+    /**
+     * 自定义属性查询封装
+     */
+    private static class CustomPropQuery {
+        final String key;
+        final String propId;
+        
+        CustomPropQuery(String key, String propId) {
+            this.key = key;
+            this.propId = propId;
+        }
     }
     
     private void fillBasicFieldsFromMap(EventAttrRow row, Map<String, Object> pr, Integer platform, String dt,
@@ -182,7 +272,7 @@ public class EventAttrTransfer implements Serializable {
             row.setBv(NULL_VALUE);
         }
         
-        // 列28-32: UTM (与Scala版本一致的推断逻辑)
+        // 列28-32: UTM
         String source = getStringValue(pr, "$utm_source");
         String medium = getStringValue(pr, "$utm_medium");
         String campaign = getStringValue(pr, "$utm_campaign");
@@ -190,12 +280,10 @@ public class EventAttrTransfer implements Serializable {
         String utmTerm = getStringValue(pr, "$utm_term");
         String eqid = getStringValue(pr, "$eqid");
         
-        // 当所有UTM参数都为空时，根据来源网站推断
         if (isNullOrEmpty(source) && isNullOrEmpty(medium) && isNullOrEmpty(campaign) 
                 && isNullOrEmpty(utmContent) && isNullOrEmpty(utmTerm)) {
             
             if (isSearchEngine(website)) {
-                // 搜索引擎流量
                 medium = "搜索自然流量";
                 source = website;
                 if (isNullOrEmpty(eqid)) {
@@ -208,7 +296,6 @@ public class EventAttrTransfer implements Serializable {
                     medium = NULL_VALUE;
                     source = NULL_VALUE;
                 } else {
-                    // 引荐流量
                     medium = "引荐";
                     source = website;
                     if (isNullOrEmpty(utmTerm)) {
@@ -221,7 +308,6 @@ public class EventAttrTransfer implements Serializable {
                 }
             }
         } else {
-            // 有UTM参数时，source 默认用 website
             source = ensureLength(isNullOrEmpty(source) ? website : source, 256);
         }
         
@@ -243,62 +329,24 @@ public class EventAttrTransfer implements Serializable {
         row.setAttr5(getStringValue(pr, "$zg_zgid") + "_" + getStringValue(pr, "$zg_sid"));
     }
     
-    private void fillCustomPropertiesFromMap(EventAttrRow row, Map<String, Object> pr, String dt, String zgEid) {
-        Set<String> attrSet = getAttrSet(dt);
-        
-        for (String key : pr.keySet()) {
-            boolean isCustomProp = false;
-            
-            // evt 类型: 以 "_" 开头的属性
-            if ("evt".equals(dt) && key.startsWith("_")) {
-                isCustomProp = true;
-            } 
-            // mkt/abp 类型: 不以 "$" 开头，且不在排除集合中的属性
-            else if (("mkt".equals(dt) || "abp".equals(dt)) && !key.startsWith("$") && !attrSet.contains(key.replace("$", ""))) {
-                isCustomProp = true;
-            }
-            
-            if (isCustomProp) {
-                // 使用 $zg_epid# 获取属性ID (与Scala一致)
-                String propIdKey = "$zg_epid#" + key;
-                String propId = getStringValue(pr, propIdKey);
-                
-                if (!isNullOrEmpty(propId)) {
-                    // 获取列索引 (1-100)
-                    int colIndex = columnService.getColumnIndex(zgEid, propId);
-                    if (colIndex >= 1 && colIndex <= 100) {
-                        // 设置属性值
-                        String propValue = ensureLength(getStringValue(pr, key), eventAttrLengthLimit);
-                        row.setCustomProperty(colIndex, propValue);
-                        
-                        // 设置属性类型 (使用 $zg_eptp#)
-                        String propTypeKey = "$zg_eptp#" + key;
-                        String propType = ensureLength(getStringValue(pr, propTypeKey), 256);
-                        row.setPropertyType(colIndex, propType);
-                    }
-                }
-            }
-        }
-    }
-    
     // ============ 工具方法 ============
     
     private Set<String> getAttrSet(String dt) {
-        if ("mkt".equals(dt)) return mktAttrs;
-        if ("abp".equals(dt)) return abpAttrs;
+        if ("mkt".equals(dt)) { return mktAttrs; }
+        if ("abp".equals(dt)) { return abpAttrs; }
         return Collections.emptySet();
     }
     
     private String getEventNameFromMap(Map<String, Object> pr) {
         String zgEid = getStringValue(pr, "$zg_eid");
-        if ("-1".equals(zgEid)) return "st";
-        if ("-2".equals(zgEid)) return "se";
+        if ("-1".equals(zgEid)) { return "st"; }
+        if ("-2".equals(zgEid)) { return "se"; }
         return getStringValue(pr, "$eid");
     }
     
     private String timestampToDateString(Long ct, Integer tz) {
-        if (ct == null || tz == null) return NULL_VALUE;
-        if (Math.abs(tz) > 48 * 3600 * 1000) return NULL_VALUE;
+        if (ct == null || tz == null) { return NULL_VALUE; }
+        if (Math.abs(tz) > 48 * 3600 * 1000) { return NULL_VALUE; }
         try { return DATE_FORMAT.get().format(new Date(ct)); } 
         catch (Exception e) { return NULL_VALUE; }
     }
@@ -351,7 +399,7 @@ public class EventAttrTransfer implements Serializable {
     }
     
     private boolean isSearchEngine(String website) {
-        if (isNullOrEmpty(website)) return false;
+        if (isNullOrEmpty(website)) { return false; }
         return website.contains(WWW_BAIDU_COM) || website.contains(WWW_SOGOU_COM) ||
                website.contains(CN_BING_COM) || website.contains(WWW_SO_COM) ||
                website.contains(M_SM_CN) || website.contains(WWW_GOOGLE_COM) ||
@@ -359,29 +407,27 @@ public class EventAttrTransfer implements Serializable {
     }
     
     private String getUtmTermFromRef(String utmTerm, String referrerUrl) {
-        if (!isNullOrEmpty(utmTerm)) return utmTerm;
-        if (isNullOrEmpty(referrerUrl)) return NULL_VALUE;
+        if (!isNullOrEmpty(utmTerm)) { return utmTerm; }
+        if (isNullOrEmpty(referrerUrl)) { return NULL_VALUE; }
         
-        // 解析 referrer URL 获取关键词 (与Scala ZGMethod.getKeyWords 一致)
         try {
             java.net.URI uri = new java.net.URI(referrerUrl);
             String host = uri.getHost();
             String query = uri.getQuery();
             
-            if (query == null) return NULL_VALUE;
+            if (query == null) { return NULL_VALUE; }
             
             Map<String, String> params = parseQueryString(query);
             
-            // 根据不同搜索引擎获取关键词参数
             if (host != null) {
                 if (host.contains(WWW_SOGOU_COM)) {
                     String keyword = params.get("query");
-                    if (keyword != null) return java.net.URLDecoder.decode(keyword, "UTF-8");
+                    if (keyword != null) { return java.net.URLDecoder.decode(keyword, "UTF-8"); }
                 } else if (host.contains(CN_BING_COM) || host.contains(WWW_SO_COM) 
                         || host.contains(M_SM_CN) || host.contains(WWW_GOOGLE_COM) 
                         || host.contains(WWW_GOOGLE_CO)) {
                     String keyword = params.get("q");
-                    if (keyword != null) return java.net.URLDecoder.decode(keyword, "UTF-8");
+                    if (keyword != null) { return java.net.URLDecoder.decode(keyword, "UTF-8"); }
                 }
             }
         } catch (Exception e) {
@@ -392,7 +438,7 @@ public class EventAttrTransfer implements Serializable {
     
     private Map<String, String> parseQueryString(String query) {
         Map<String, String> params = new HashMap<>();
-        if (query == null) return params;
+        if (query == null) { return params; }
         for (String param : query.split("&")) {
             String[] pair = param.split("=", 2);
             if (pair.length == 2) {
@@ -403,23 +449,23 @@ public class EventAttrTransfer implements Serializable {
     }
     
     private String getStringValue(Map<String, Object> map, String key) {
-        if (map == null || key == null) return NULL_VALUE;
+        if (map == null || key == null) { return NULL_VALUE; }
         Object value = map.get(key);
         return value != null ? String.valueOf(value) : NULL_VALUE;
     }
     
     private Long getLongValue(Map<String, Object> map, String key) {
         Object value = map.get(key);
-        if (value == null) return null;
-        if (value instanceof Number) return ((Number) value).longValue();
+        if (value == null) { return null; }
+        if (value instanceof Number) { return ((Number) value).longValue(); }
         try { return Long.parseLong(String.valueOf(value)); } 
         catch (NumberFormatException e) { return null; }
     }
     
     private Integer getIntValue(Map<String, Object> map, String key) {
         Object value = map.get(key);
-        if (value == null) return null;
-        if (value instanceof Number) return ((Number) value).intValue();
+        if (value == null) { return null; }
+        if (value instanceof Number) { return ((Number) value).intValue(); }
         try { return Integer.parseInt(String.valueOf(value)); } 
         catch (NumberFormatException e) { return null; }
     }
@@ -429,36 +475,36 @@ public class EventAttrTransfer implements Serializable {
     }
     
     private String ensureLength(String value, int maxLength) {
-        if (isNullOrEmpty(value)) return NULL_VALUE;
+        if (isNullOrEmpty(value)) { return NULL_VALUE; }
         value = value.replaceAll("[\t\n\r\"\\\\\u0000]", " ").trim();
         return value.length() > maxLength ? value.substring(0, maxLength) : value;
     }
     
     private String ensureNetwork(String value) {
-        if ("-1".equals(value)) return NULL_VALUE;
+        if ("-1".equals(value)) { return NULL_VALUE; }
         return ensureIntLength(value, 256);
     }
     
     private String ensureIntLength(String value, int maxLength) {
-        if (isNullOrEmpty(value) || "null".equals(value)) return NULL_VALUE;
-        if (value.length() > 6 || !value.matches("[0-9]*")) return NULL_VALUE;
+        if (isNullOrEmpty(value) || "null".equals(value)) { return NULL_VALUE; }
+        if (value.length() > 6 || !value.matches("[0-9]*")) { return NULL_VALUE; }
         return value;
     }
     
     private String ensureIntRange(String value, int min, int max) {
-        if (isNullOrEmpty(value)) return NULL_VALUE;
+        if (isNullOrEmpty(value)) { return NULL_VALUE; }
         try {
             int intValue = Integer.parseInt(value);
-            if (intValue >= min && intValue <= max) return value;
+            if (intValue >= min && intValue <= max) { return value; }
         } catch (NumberFormatException e) { }
         return NULL_VALUE;
     }
     
     private Long ipToLong(String ip) {
-        if (isNullOrEmpty(ip)) return null;
+        if (isNullOrEmpty(ip)) { return null; }
         try {
             String[] parts = ip.split("\\.");
-            if (parts.length != 4) return null;
+            if (parts.length != 4) { return null; }
             long result = 0;
             for (int i = 0; i < 4; i++) {
                 result = (result << 8) | Integer.parseInt(parts[i]);

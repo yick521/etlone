@@ -1,231 +1,491 @@
 package com.zhugeio.etl.pipeline.operator.dw;
 
-import com.zhugeio.etl.common.model.output.*;
-import com.zhugeio.etl.pipeline.config.Config;
-import com.zhugeio.etl.pipeline.example.ZGMessage;
+import com.zhugeio.etl.common.cache.CacheConfig;
+import com.zhugeio.etl.common.cache.ConfigCacheService;
+import com.zhugeio.etl.common.metrics.OperatorMetrics;
+import com.zhugeio.etl.common.model.DeviceRow;
+import com.zhugeio.etl.common.model.EventAttrRow;
+import com.zhugeio.etl.common.model.UserPropertyRow;
+import com.zhugeio.etl.common.model.UserRow;
+import com.zhugeio.etl.pipeline.dataquality.DataQualityContext;
+import com.zhugeio.etl.pipeline.dataquality.DataQualityKafkaService;
+import com.zhugeio.etl.pipeline.dataquality.DataValidator;
+import com.zhugeio.etl.pipeline.entity.ZGMessage;
 import com.zhugeio.etl.pipeline.service.BaiduKeywordService;
-import com.zhugeio.etl.pipeline.service.EventAttrColumnService;
-import com.zhugeio.etl.pipeline.transfer.*;
+import com.zhugeio.etl.pipeline.transfer.DeviceTransfer;
+import com.zhugeio.etl.pipeline.transfer.EventAttrTransfer;
+import com.zhugeio.etl.pipeline.transfer.UserPropertyTransfer;
+import com.zhugeio.etl.pipeline.transfer.UserTransfer;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.streaming.api.functions.ProcessFunction;
-import org.apache.flink.util.Collector;
-import org.apache.flink.util.OutputTag;
+import org.apache.flink.streaming.api.functions.async.ResultFuture;
+import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 数据路由算子
+ * 数据路由异步算子
  * 
- * 对应 Scala: MsgTransfer.transfer
- * 
- * 输入: 已富化的 ZGMessage (包含 IP/UA 解析结果)
- * 输出: 根据 dt 类型路由到不同的侧输出
- * 
- * 路由规则:
- * - zgid -> UserRow
- * - pl -> DeviceRow
- * - usr -> UserPropertyRow (可能多条)
- * - evt/vtl/mkt/ss/se/abp -> EventAttrRow
- * 
- * 注意: 不再输出 EventAllRow (Scala 工程中可配置关闭)
+ *
+ * 1. 继承 RichAsyncFunction 实现异步处理
+ * 2. 输出统一包装类 RouterOutput，包含所有类型的输出
+ * 3. 下游使用 ProcessFunction 解包并路由到侧输出
+ *
+ * ```
  */
-public class DataRouterOperator extends ProcessFunction<ZGMessage, EventAttrRow> {
-    
+public class DataRouterOperator extends RichAsyncFunction<ZGMessage, RouterOutput> {
+
     private static final long serialVersionUID = 1L;
     private static final Logger LOG = LoggerFactory.getLogger(DataRouterOperator.class);
+
+    // 配置参数
+    private final String kvrocksHost;
+    private final int kvrocksPort;
+    private final boolean kvrocksCluster;
+    private final int localCacheSize;
+    private final int localCacheExpireMinutes;
+    private final String blackAppIdsStr;
+    private final String whiteAppIdsStr;
+    private final int expireSubDays;
+    private final int expireAddDays;
+    private final int eventAttrLengthLimit;
+    private final boolean dataQualityEnabled;
     
-    // 侧输出标签
-    public static final OutputTag<UserRow> USER_OUTPUT = 
-            new OutputTag<UserRow>("user-output") {};
-    public static final OutputTag<DeviceRow> DEVICE_OUTPUT = 
-            new OutputTag<DeviceRow>("device-output") {};
-    public static final OutputTag<UserPropertyRow> USER_PROPERTY_OUTPUT = 
-            new OutputTag<UserPropertyRow>("user-property-output") {};
-    
-    // 黑名单应用
-    private Set<String> blackAppIds;
-    
-    // 白名单应用 (用于百度关键词)
-    private Set<String> whiteAppIds;
-    
-    // CDP 应用
-    private Set<Integer> cdpAppIds;
-    
-    // 转换器
+    // 百度关键词配置
+    private final String baiduUrl;
+    private final String baiduId;
+    private final String baiduKey;
+    private final String redisHost;
+    private final int redisPort;
+    private final boolean redisCluster;
+    private final int requestSocketTimeout;
+    private final int requestConnectTimeout;
+
+    // 运行时组件 (transient)
+    private transient Set<String> blackAppIds;
+    private transient Set<String> whiteAppIds;
+    private transient ConfigCacheService configCacheService;
+    private transient BaiduKeywordService keywordService;
     private transient UserTransfer userTransfer;
     private transient DeviceTransfer deviceTransfer;
     private transient UserPropertyTransfer userPropertyTransfer;
     private transient EventAttrTransfer eventAttrTransfer;
-    
-    // 服务
-    private transient EventAttrColumnService columnService;
-    private transient BaiduKeywordService keywordService;
-    
+    private transient DataValidator dataValidator;
+    private transient OperatorMetrics metrics;
+
     // 统计
-    private final AtomicLong userCount = new AtomicLong(0);
-    private final AtomicLong deviceCount = new AtomicLong(0);
-    private final AtomicLong userPropertyCount = new AtomicLong(0);
-    private final AtomicLong eventAttrCount = new AtomicLong(0);
-    private final AtomicLong unknownCount = new AtomicLong(0);
-    private final AtomicLong errorCount = new AtomicLong(0);
-    private final AtomicLong blacklistedCount = new AtomicLong(0);
-    
+    private transient AtomicLong userCount;
+    private transient AtomicLong deviceCount;
+    private transient AtomicLong userPropertyCount;
+    private transient AtomicLong eventAttrCount;
+    private transient AtomicLong errorCount;
+
+    public DataRouterOperator(
+            String kvrocksHost, int kvrocksPort, boolean kvrocksCluster,
+            int localCacheSize, int localCacheExpireMinutes,
+            String blackAppIdsStr, String whiteAppIdsStr,
+            int expireSubDays, int expireAddDays, int eventAttrLengthLimit,
+            boolean dataQualityEnabled,
+            String baiduUrl, String baiduId, String baiduKey,
+            String redisHost, int redisPort, boolean redisCluster,
+            int requestSocketTimeout, int requestConnectTimeout) {
+        
+        this.kvrocksHost = kvrocksHost;
+        this.kvrocksPort = kvrocksPort;
+        this.kvrocksCluster = kvrocksCluster;
+        this.localCacheSize = localCacheSize;
+        this.localCacheExpireMinutes = localCacheExpireMinutes;
+        this.blackAppIdsStr = blackAppIdsStr;
+        this.whiteAppIdsStr = whiteAppIdsStr;
+        this.expireSubDays = expireSubDays;
+        this.expireAddDays = expireAddDays;
+        this.eventAttrLengthLimit = eventAttrLengthLimit;
+        this.dataQualityEnabled = dataQualityEnabled;
+        this.baiduUrl = baiduUrl;
+        this.baiduId = baiduId;
+        this.baiduKey = baiduKey;
+        this.redisHost = redisHost;
+        this.redisPort = redisPort;
+        this.redisCluster = redisCluster;
+        this.requestSocketTimeout = requestSocketTimeout;
+        this.requestConnectTimeout = requestConnectTimeout;
+    }
+
     @Override
     public void open(Configuration parameters) throws Exception {
         super.open(parameters);
-        
-        // 加载黑名单
-        String blackAppsStr = Config.getString(Config.BLACK_APPIDS, "-1");
-        blackAppIds = new HashSet<>(Arrays.asList(blackAppsStr.split(",")));
-        
-        // 加载白名单 (用于百度关键词)
-        String whiteAppsStr = Config.getString(Config.WHITE_APPID, "");
+
+        metrics = OperatorMetrics.create(getRuntimeContext().getMetricGroup(), "data_router_async");
+
+        // 初始化黑白名单
+        blackAppIds = new HashSet<>(Arrays.asList(blackAppIdsStr.split(",")));
         whiteAppIds = new HashSet<>();
-        if (!whiteAppsStr.isEmpty()) {
-            whiteAppIds.addAll(Arrays.asList(whiteAppsStr.split(",")));
+        if (whiteAppIdsStr != null && !whiteAppIdsStr.isEmpty()) {
+            whiteAppIds.addAll(Arrays.asList(whiteAppIdsStr.split(",")));
         }
-        
-        // CDP 应用 (TODO: 从配置或数据库加载)
-        cdpAppIds = new HashSet<>();
-        
-        // 初始化列映射服务
-        columnService = new EventAttrColumnService(
-                Config.getString(Config.KVROCKS_HOST, "localhost"),
-                Config.getInt(Config.KVROCKS_PORT, 6379),
-                Config.getBoolean(Config.KVROCKS_CLUSTER, false),
-                Config.getInt(Config.KVROCKS_LOCAL_CACHE_SIZE, 10000),
-                Config.getInt(Config.KVROCKS_LOCAL_CACHE_EXPIRE_MINUTES, 60)
+
+        // 初始化缓存服务
+        configCacheService = new ConfigCacheService(
+                CacheConfig.builder()
+                        .kvrocksHost(kvrocksHost)
+                        .kvrocksPort(kvrocksPort)
+                        .kvrocksCluster(kvrocksCluster)
+                        .appCacheSize(localCacheSize)
+                        .appCacheExpireMinutes(localCacheExpireMinutes)
+                        .build()
         );
-        columnService.init();
-        
+        configCacheService.init();
+
         // 初始化百度关键词服务
         keywordService = new BaiduKeywordService(
-                Config.getString(Config.BAIDU_URL, "http://referer.bj.baidubce.com/v1/eqid"),
-                Config.getString(Config.BAIDU_ID, ""),
-                Config.getString(Config.BAIDU_KEY, ""),
-                Config.getString(Config.REDIS_HOST, "localhost"),
-                Config.getInt(Config.REDIS_PORT, 6379),
-                Config.getBoolean(Config.REDIS_CLUSTER, false),
-                Config.getInt(Config.REQUEST_TIMEOUT, 5)
+                baiduUrl, baiduId, baiduKey,
+                redisHost, redisPort, redisCluster,
+                requestSocketTimeout, requestConnectTimeout
         );
         keywordService.init();
-        
+
         // 初始化转换器
         userTransfer = new UserTransfer();
         deviceTransfer = new DeviceTransfer();
-        
-        userPropertyTransfer = new UserPropertyTransfer();
-        userPropertyTransfer.setCdpAppIds(cdpAppIds);
-        
-        int expireSubDays = Config.getInt(Config.TIME_EXPIRE_SUBDAYS, 7);
-        int expireAddDays = Config.getInt(Config.TIME_EXPIRE_ADDDAYS, 1);
-        int eventAttrLengthLimit = Config.getInt(Config.EVENT_ATTR_LENGTH_LIMIT, 256);
-        eventAttrTransfer = new EventAttrTransfer(columnService, expireSubDays, expireAddDays, eventAttrLengthLimit);
-        
-        LOG.info("DataRouterOperator initialized: blackAppIds={}, whiteAppIds={}", 
-                blackAppIds.size(), whiteAppIds.size());
+        userPropertyTransfer = new UserPropertyTransfer(configCacheService);
+        eventAttrTransfer = new EventAttrTransfer(configCacheService, expireSubDays, expireAddDays, eventAttrLengthLimit);
+
+        // 初始化数据质量校验器
+        if (dataQualityEnabled) {
+            DataQualityKafkaService dqService = DataQualityKafkaService.getInstance();
+            dataValidator = new DataValidator(expireSubDays, expireAddDays, dqService);
+        }
+
+        // 初始化计数器
+        userCount = new AtomicLong(0);
+        deviceCount = new AtomicLong(0);
+        userPropertyCount = new AtomicLong(0);
+        eventAttrCount = new AtomicLong(0);
+        errorCount = new AtomicLong(0);
+
+        LOG.info("[DataRouterAsync-{}] 初始化完成", getRuntimeContext().getIndexOfThisSubtask());
     }
-    
+
     @Override
-    public void processElement(ZGMessage message, Context ctx, Collector<EventAttrRow> out) throws Exception {
-        try {
-            // 直接从 ZGMessage 获取数据
-            Map<String, Object> msgData = message.getData();
-            if (msgData == null) {
+    public void asyncInvoke(ZGMessage message, ResultFuture<RouterOutput> resultFuture) throws Exception {
+        metrics.in();
+
+        CompletableFuture.supplyAsync(() -> {
+            try {
+                return processMessage(message);
+            } catch (Exception e) {
+                LOG.error("处理消息失败", e);
                 errorCount.incrementAndGet();
-                return;
+                metrics.error();
+                return RouterOutput.empty();
             }
-            
-            // 从 ZGMessage 获取基础信息
-            Integer appId = message.getAppId();
-            String business = message.getBusiness();
-            
-            if (appId == null || appId == 0) {
+        }).whenComplete((output, throwable) -> {
+            if (throwable != null) {
+                LOG.error("异步处理异常", throwable);
                 errorCount.incrementAndGet();
-                return;
+                metrics.error();
+                resultFuture.complete(Collections.singleton(RouterOutput.empty()));
+            } else {
+                metrics.out();
+                resultFuture.complete(Collections.singleton(output));
             }
-            
-            // 黑名单检查
-            if (blackAppIds.contains(String.valueOf(appId))) {
-                blacklistedCount.incrementAndGet();
-                return;
+        });
+    }
+
+    /**
+     * 处理消息 - 核心逻辑
+     */
+    private RouterOutput processMessage(ZGMessage message) {
+        // 版本检查
+        configCacheService.checkAndRefreshVersion();
+
+        Map<String, Object> msgData = message.getData();
+        if (msgData == null) {
+            metrics.skip();
+            return RouterOutput.empty();
+        }
+
+        Integer appId = message.getAppId();
+        String business = message.getBusiness();
+
+        if (appId == null || appId == 0) {
+            metrics.skip();
+            return RouterOutput.empty();
+        }
+
+        // 黑名单检查
+        if (blackAppIds.contains(String.valueOf(appId))) {
+            metrics.skip();
+            return RouterOutput.empty();
+        }
+
+        // 提取基础信息
+        Integer platform = getIntValue(msgData, "plat", 0);
+        String ua = getStringValue(msgData, "ua");
+        String ip = getStringValue(msgData, "ip");
+        String sdk = getStringValue(msgData, "sdk");
+        String pl = getStringValue(msgData, "pl");
+        Long msgSt = getLongValue(msgData, "st", null);
+
+        // 获取设备 MD5
+        String deviceMd5 = null;
+        Object usrObj = msgData.get("usr");
+        if (usrObj instanceof Map) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> usr = (Map<String, Object>) usrObj;
+            deviceMd5 = getStringValue(usr, "did");
+        }
+
+        // 提取富化数据
+        String[] ipResult = extractIpResult(msgData);
+        Map<String, String> uaResult = extractUaResult(msgData);
+        if (business == null || business.isEmpty()) {
+            business = getStringValue(msgData, "business", "\\N");
+        }
+
+        // 获取 data 数组
+        Object dataObj = msgData.get("data");
+        if (dataObj == null) {
+            metrics.skip();
+            return RouterOutput.empty();
+        }
+
+        List<?> dataList = (List<?>) dataObj;
+        if (dataList.isEmpty()) {
+            metrics.skip();
+            return RouterOutput.empty();
+        }
+
+        // 预加载关键词
+        Map<String, String> eqidKeywords = preloadKeywords(appId, dataList);
+
+        // 构建输出
+        RouterOutput output = new RouterOutput();
+        String rawJson = message.getRawData();
+
+        // 处理每个数据项
+        for (Object item : dataList) {
+            if (item == null) {
+                continue;
             }
-            
-            // 从 data map 获取其他字段
-            Integer platform = getIntValue(msgData, "plat", 0);
-            String ua = getStringValue(msgData, "ua");
-            String ip = getStringValue(msgData, "ip");
-            
-            // 获取消息级别的 st 时间戳 (用于 DeviceTransfer)
-            Long msgSt = getLongValue(msgData, "st", null);
-            
-            // 获取设备 MD5 (来自 usr.did)
-            String deviceMd5 = null;
-            Object usrObj = msgData.get("usr");
-            if (usrObj instanceof Map) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> usr = (Map<String, Object>) usrObj;
-                deviceMd5 = getStringValue(usr, "did");
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> dataItem = (Map<String, Object>) item;
+
+            String dt = getStringValue(dataItem, "dt");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> pr = (Map<String, Object>) dataItem.get("pr");
+
+            if (dt == null || pr == null) {
+                continue;
             }
-            
-            // 获取富化数据 (由上游算子填充)
-            String[] ipResult = extractIpResultFromMap(msgData);
-            Map<String, String> uaResult = extractUaResultFromMap(msgData);
-            if (business == null || business.isEmpty()) {
-                business = getStringValue(msgData, "business", "\\N");
-            }
-            
-            // 获取 data 数组
-            Object dataObj = msgData.get("data");
-            if (dataObj == null) {
-                return;
-            }
-            
-            List<?> dataList = (List<?>) dataObj;
-            if (dataList.isEmpty()) {
-                return;
-            }
-            
-            // 预先提取所有 eqid 用于批量查询关键词
-            Map<String, String> eqidKeywords = preloadKeywordsFromList(appId, dataList);
-            
-            // 处理每个数据项
-            for (Object item : dataList) {
-                if (item == null) {
-                    continue;
+
+            // 根据 dt 类型路由
+            routeByDt(output, dt, appId, platform, pr, ip, ipResult, ua, uaResult,
+                    business, eqidKeywords, msgSt, deviceMd5, sdk, pl, rawJson);
+        }
+
+        return output;
+    }
+
+    /**
+     * 根据 dt 类型路由数据
+     */
+    private void routeByDt(RouterOutput output, String dt,
+                          Integer appId, Integer platform, Map<String, Object> pr,
+                          String ip, String[] ipResult, String ua, Map<String, String> uaResult,
+                          String business, Map<String, String> eqidKeywords,
+                          Long msgSt, String deviceMd5, String sdk, String pl, String rawJson) {
+
+        switch (dt) {
+            case "zgid":
+                UserRow userRow = userTransfer.transferFromMap(appId, platform, pr);
+                if (userRow != null) {
+                    output.addUserRow(userRow);
+                    userCount.incrementAndGet();
                 }
-                
-                @SuppressWarnings("unchecked")
-                Map<String, Object> dataItem = (Map<String, Object>) item;
-                
-                String dt = getStringValue(dataItem, "dt");
-                @SuppressWarnings("unchecked")
-                Map<String, Object> pr = (Map<String, Object>) dataItem.get("pr");
-                
-                if (dt == null || pr == null) {
-                    continue;
+                break;
+
+            case "pl":
+                DeviceRow deviceRow = deviceTransfer.transferFromMap(appId, platform, pr, msgSt, deviceMd5);
+                if (deviceRow != null) {
+                    output.addDeviceRow(deviceRow);
+                    deviceCount.incrementAndGet();
                 }
-                
-                // 根据 dt 类型路由
-                routeByDtFromMap(ctx, out, dt, appId, platform, pr, ip, ipResult, ua, uaResult, 
-                          business, eqidKeywords, msgSt, deviceMd5);
-            }
-            
-        } catch (Exception e) {
-            errorCount.incrementAndGet();
-            LOG.error("Error processing message", e);
+                break;
+
+            case "usr":
+                List<UserPropertyRow> propRows = userPropertyTransfer.transferFromMap(appId, platform, pr);
+                for (UserPropertyRow propRow : propRows) {
+                    output.addUserPropertyRow(propRow);
+                    userPropertyCount.incrementAndGet();
+                }
+                break;
+
+            case "evt":
+            case "vtl":
+            case "mkt":
+            case "ss":
+            case "se":
+            case "abp":
+                processEventAttr(output, dt, appId, platform, pr, ip, ipResult, ua, uaResult,
+                        business, eqidKeywords, sdk, pl, rawJson);
+                break;
+
+            default:
+                break;
         }
     }
-    
-    // ============ Map 工具方法 ============
-    
+
+    /**
+     * 处理事件属性
+     */
+    private void processEventAttr(RouterOutput output, String dt,
+                                  Integer appId, Integer platform, Map<String, Object> pr,
+                                  String ip, String[] ipResult, String ua, Map<String, String> uaResult,
+                                  String business, Map<String, String> eqidKeywords,
+                                  String sdk, String pl, String rawJson) {
+
+        String zgZgid = getStringValue(pr, "$zg_zgid");
+        String zgEid = getStringValue(pr, "$zg_eid");
+        String zgDid = getStringValue(pr, "$zg_did");
+        Long ct = getLongValue(pr, "$ct", null);
+        String tz = getStringValue(pr, "$tz");
+        String eventName = getStringValue(pr, "$eid", "\\N");
+
+        String realTime = formatTime(ct, tz);
+
+        // 数据质量校验
+        if (dataQualityEnabled && dataValidator != null) {
+            DataQualityContext dqCtx = DataQualityContext.builder()
+                    .appId(appId)
+                    .platform(platform)
+                    .eventName(eventName)
+                    .eventId(zgEid)
+                    .zgZgid(zgZgid)
+                    .zgDid(zgDid)
+                    .ct(ct)
+                    .tz(tz)
+                    .sdk(sdk)
+                    .pl(pl)
+                    .rawJson(rawJson)
+                    .build();
+
+            DataValidator.ValidationResult result = dataValidator.validate(dqCtx, realTime);
+            if (result.isFailed()) {
+                return;
+            }
+        }
+
+        // 转换
+        EventAttrRow eventRow = eventAttrTransfer.transferFromMap(
+                appId, platform, dt, pr, ip, ipResult, ua, uaResult, business, eqidKeywords);
+        if (eventRow != null) {
+            output.addEventAttrRow(eventRow);
+            eventAttrCount.incrementAndGet();
+        }
+    }
+
+    /**
+     * 预加载百度关键词
+     */
+    private Map<String, String> preloadKeywords(Integer appId, List<?> dataList) {
+        Map<String, String> result = new HashMap<>();
+
+        if (!whiteAppIds.contains(String.valueOf(appId))) {
+            return result;
+        }
+
+        Set<String> eqids = new HashSet<>();
+
+        for (Object item : dataList) {
+            if (item == null) {
+                continue;
+            }
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> dataItem = (Map<String, Object>) item;
+
+            String dt = getStringValue(dataItem, "dt");
+            if (dt == null || !keywordService.shouldExtractKeyword(dt)) {
+                continue;
+            }
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> pr = (Map<String, Object>) dataItem.get("pr");
+            if (pr == null) {
+                continue;
+            }
+
+            String utmTerm = getStringValue(pr, "$utm_term");
+            if (utmTerm != null && !utmTerm.isEmpty() && !"\\N".equals(utmTerm)) {
+                continue;
+            }
+
+            String ref = getStringValue(pr, "$ref");
+            String eqid = keywordService.extractEqid(ref);
+            if (eqid != null) {
+                eqids.add(eqid);
+                pr.put("$eqid", eqid);
+            }
+        }
+
+        if (!eqids.isEmpty()) {
+            try {
+                result = keywordService.preloadKeywordsAsync(eqids).join();
+            } catch (Exception e) {
+                LOG.warn("预加载关键词失败", e);
+            }
+        }
+
+        return result;
+    }
+
+    // ============ 工具方法 ============
+
+    private String[] extractIpResult(Map<String, Object> msgData) {
+        return new String[]{
+                getStringValue(msgData, "country", "\\N"),
+                getStringValue(msgData, "province", "\\N"),
+                getStringValue(msgData, "city", "\\N")
+        };
+    }
+
+    private Map<String, String> extractUaResult(Map<String, Object> msgData) {
+        Map<String, String> result = new HashMap<>();
+        result.put("os", getStringValue(msgData, "os", null));
+        result.put("os_version", getStringValue(msgData, "os_version", null));
+        result.put("browser", getStringValue(msgData, "browser", null));
+        result.put("browser_version", getStringValue(msgData, "browser_version", null));
+        return result;
+    }
+
+    private String formatTime(Long ct, String tz) {
+        if (ct == null || tz == null || "\\N".equals(tz)) {
+            return "\\N";
+        }
+        try {
+            long tzOffset = Long.parseLong(tz);
+            if (tzOffset > 48 * 3600 * 1000 || tzOffset < -48 * 3600 * 1000) {
+                return "\\N";
+            }
+            Calendar cal = Calendar.getInstance();
+            cal.setTimeInMillis(ct);
+            java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+            String result = sdf.format(cal.getTime());
+            return result.length() > 19 ? "\\N" : result;
+        } catch (Exception e) {
+            return "\\N";
+        }
+    }
+
     private String getStringValue(Map<String, Object> map, String key) {
         return getStringValue(map, key, null);
     }
-    
+
     private String getStringValue(Map<String, Object> map, String key, String defaultValue) {
         Object value = map.get(key);
         if (value == null) {
@@ -233,7 +493,7 @@ public class DataRouterOperator extends ProcessFunction<ZGMessage, EventAttrRow>
         }
         return String.valueOf(value);
     }
-    
+
     private Integer getIntValue(Map<String, Object> map, String key, Integer defaultValue) {
         Object value = map.get(key);
         if (value == null) {
@@ -248,7 +508,7 @@ public class DataRouterOperator extends ProcessFunction<ZGMessage, EventAttrRow>
             return defaultValue;
         }
     }
-    
+
     private Long getLongValue(Map<String, Object> map, String key, Long defaultValue) {
         Object value = map.get(key);
         if (value == null) {
@@ -263,199 +523,27 @@ public class DataRouterOperator extends ProcessFunction<ZGMessage, EventAttrRow>
             return defaultValue;
         }
     }
-    
-    /**
-     * 根据 dt 类型路由数据 (使用 Map)
-     */
-    private void routeByDtFromMap(Context ctx, Collector<EventAttrRow> out, String dt,
-                           Integer appId, Integer platform, Map<String, Object> pr,
-                           String ip, String[] ipResult, String ua, Map<String, String> uaResult,
-                           String business, Map<String, String> eqidKeywords,
-                           Long msgSt, String deviceMd5) {
-        
-        switch (dt) {
-            case "zgid":
-                // 用户映射表
-                UserRow userRow = userTransfer.transferFromMap(appId, platform, pr);
-                if (userRow != null) {
-                    ctx.output(USER_OUTPUT, userRow);
-                    userCount.incrementAndGet();
-                }
-                break;
-                
-            case "pl":
-                // 设备表
-                DeviceRow deviceRow = deviceTransfer.transferFromMap(appId, platform, pr, msgSt, deviceMd5);
-                if (deviceRow != null) {
-                    ctx.output(DEVICE_OUTPUT, deviceRow);
-                    deviceCount.incrementAndGet();
-                }
-                break;
-                
-            case "usr":
-                // 用户属性表 (可能产生多条)
-                List<UserPropertyRow> propRows = userPropertyTransfer.transferFromMap(appId, platform, pr);
-                for (UserPropertyRow propRow : propRows) {
-                    ctx.output(USER_PROPERTY_OUTPUT, propRow);
-                    userPropertyCount.incrementAndGet();
-                }
-                break;
-                
-            case "evt":
-            case "vtl":
-            case "mkt":
-            case "ss":
-            case "se":
-            case "abp":
-                // 事件属性表
-                EventAttrRow eventRow = eventAttrTransfer.transferFromMap(
-                        appId, platform, dt, pr, ip, ipResult, ua, uaResult, business, eqidKeywords);
-                if (eventRow != null) {
-                    out.collect(eventRow);
-                    eventAttrCount.incrementAndGet();
-                }
-                break;
-                
-            default:
-                unknownCount.incrementAndGet();
-                break;
-        }
+
+    @Override
+    public void timeout(ZGMessage input, ResultFuture<RouterOutput> resultFuture) throws Exception {
+        LOG.warn("处理超时: offset={}", input.getOffset());
+        metrics.error();
+        resultFuture.complete(Collections.singleton(RouterOutput.empty()));
     }
-    
-    /**
-     * 预加载百度关键词 (使用 List)
-     */
-    private Map<String, String> preloadKeywordsFromList(Integer appId, List<?> dataList) {
-        Map<String, String> result = new HashMap<>();
-        
-        // 只对白名单应用启用
-        if (!whiteAppIds.contains(String.valueOf(appId))) {
-            return result;
-        }
-        
-        Set<String> eqids = new HashSet<>();
-        
-        for (Object item : dataList) {
-            if (item == null) {
-                continue;
-            }
-            
-            @SuppressWarnings("unchecked")
-            Map<String, Object> dataItem = (Map<String, Object>) item;
-            
-            String dt = getStringValue(dataItem, "dt");
-            if (dt == null || !keywordService.shouldExtractKeyword(dt)) {
-                continue;
-            }
-            
-            @SuppressWarnings("unchecked")
-            Map<String, Object> pr = (Map<String, Object>) dataItem.get("pr");
-            if (pr == null) {
-                continue;
-            }
-            
-            // 检查是否已有 utm_term
-            String utmTerm = getStringValue(pr, "$utm_term");
-            if (utmTerm != null && !utmTerm.isEmpty() && !"\\N".equals(utmTerm)) {
-                continue;
-            }
-            
-            // 提取 eqid
-            String ref = getStringValue(pr, "$ref");
-            String eqid = keywordService.extractEqid(ref);
-            if (eqid != null) {
-                eqids.add(eqid);
-                // 回写 eqid 到 pr
-                pr.put("$eqid", eqid);
-            }
-        }
-        
-        // 批量查询
-        if (!eqids.isEmpty()) {
-            try {
-                result = keywordService.preloadKeywordsAsync(eqids).get();
-            } catch (Exception e) {
-                LOG.warn("Failed to preload keywords", e);
-            }
-        }
-        
-        return result;
-    }
-    
-    /**
-     * 从 Map 提取 IP 解析结果
-     */
-    @SuppressWarnings("unchecked")
-    private String[] extractIpResultFromMap(Map<String, Object> msgData) {
-        Object enrichedObj = msgData.get("_enriched");
-        if (enrichedObj == null) {
-            return new String[]{"\\N", "\\N", "\\N"};
-        }
-        
-        Map<String, Object> enriched = (Map<String, Object>) enrichedObj;
-        Object ipInfoObj = enriched.get("ip");
-        if (ipInfoObj == null) {
-            return new String[]{"\\N", "\\N", "\\N"};
-        }
-        
-        Map<String, Object> ipInfo = (Map<String, Object>) ipInfoObj;
-        return new String[]{
-                getStringValue(ipInfo, "country", "\\N"),
-                getStringValue(ipInfo, "province", "\\N"),
-                getStringValue(ipInfo, "city", "\\N")
-        };
-    }
-    
-    /**
-     * 从 Map 提取 UA 解析结果
-     */
-    @SuppressWarnings("unchecked")
-    private Map<String, String> extractUaResultFromMap(Map<String, Object> msgData) {
-        Map<String, String> result = new HashMap<>();
-        
-        Object enrichedObj = msgData.get("_enriched");
-        if (enrichedObj == null) {
-            return result;
-        }
-        
-        Map<String, Object> enriched = (Map<String, Object>) enrichedObj;
-        Object uaInfoObj = enriched.get("ua");
-        if (uaInfoObj == null) {
-            return result;
-        }
-        
-        Map<String, Object> uaInfo = (Map<String, Object>) uaInfoObj;
-        result.put("os", getStringValue(uaInfo, "os"));
-        result.put("os_version", getStringValue(uaInfo, "os_version"));
-        result.put("browser", getStringValue(uaInfo, "browser"));
-        result.put("browser_version", getStringValue(uaInfo, "browser_version"));
-        
-        return result;
-    }
-    
+
     @Override
     public void close() throws Exception {
-        LOG.info("Closing DataRouterOperator - Stats: user={}, device={}, userProperty={}, " +
-                 "eventAttr={}, unknown={}, error={}, blacklisted={}",
-                userCount.get(), deviceCount.get(), userPropertyCount.get(),
-                eventAttrCount.get(), unknownCount.get(), errorCount.get(), blacklistedCount.get());
-        
-        if (columnService != null) {
-            columnService.close();
+        LOG.info("[DataRouterAsync] Metrics: in={}, out={}, error={}, skip={}",
+                metrics.getIn(), metrics.getOut(), metrics.getError(), metrics.getSkip());
+        LOG.info("[DataRouterAsync] Stats: user={}, device={}, userProp={}, eventAttr={}",
+                userCount.get(), deviceCount.get(), userPropertyCount.get(), eventAttrCount.get());
+
+        if (configCacheService != null) {
+            configCacheService.close();
         }
-        
         if (keywordService != null) {
             keywordService.close();
         }
-        
         super.close();
     }
-    
-    // Getters for stats
-    public long getUserCount() { return userCount.get(); }
-    public long getDeviceCount() { return deviceCount.get(); }
-    public long getUserPropertyCount() { return userPropertyCount.get(); }
-    public long getEventAttrCount() { return eventAttrCount.get(); }
-    public long getUnknownCount() { return unknownCount.get(); }
-    public long getErrorCount() { return errorCount.get(); }
 }

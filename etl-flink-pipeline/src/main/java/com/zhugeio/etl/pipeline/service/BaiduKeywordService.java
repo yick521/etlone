@@ -49,7 +49,8 @@ public class BaiduKeywordService implements Serializable {
     private final String redisHost;
     private final int redisPort;
     private final boolean redisCluster;
-    private final int requestTimeout;
+    private final int requestSocketTimeout;
+    private final int requestConnectTimeout;
     
     // L1 本地缓存 (transient)
     private transient Map<String, String> localCache;
@@ -66,14 +67,15 @@ public class BaiduKeywordService implements Serializable {
     
     public BaiduKeywordService(String baiduUrl, String baiduId, String baiduKey,
                                 String redisHost, int redisPort, boolean redisCluster,
-                                int requestTimeout) {
+                                int requestSocketTimeout, int requestConnectTimeout) {
         this.baiduUrl = baiduUrl;
         this.baiduId = baiduId;
         this.baiduKey = baiduKey;
         this.redisHost = redisHost;
         this.redisPort = redisPort;
         this.redisCluster = redisCluster;
-        this.requestTimeout = requestTimeout;
+        this.requestSocketTimeout = requestSocketTimeout;
+        this.requestConnectTimeout = requestConnectTimeout;
     }
     
     /**
@@ -84,7 +86,7 @@ public class BaiduKeywordService implements Serializable {
         localCache = new ConcurrentHashMap<String, String>(5000);
         
         // 获取 HTTP 客户端单例
-        httpClient = HttpClientWrapper.getInstance(5, requestTimeout, 3, 10);
+        httpClient = HttpClientWrapper.getInstance(requestSocketTimeout, requestConnectTimeout, 3, 10);
         
         // 初始化 Redis 客户端 (用于关键词缓存)
         redisClient = new KvrocksClient(redisHost, redisPort, redisCluster);
