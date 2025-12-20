@@ -28,13 +28,6 @@ import java.util.concurrent.atomic.AtomicLong;
  * - 同步和异步请求
  * - 自动重试
  * - TaskManager 内静态单例复用
- * 
- * Maven 依赖:
- * <dependency>
- *     <groupId>org.apache.httpcomponents</groupId>
- *     <artifactId>httpclient</artifactId>
- *     <version>4.5.13</version>
- * </dependency>
  */
 public class HttpClientWrapper {
     

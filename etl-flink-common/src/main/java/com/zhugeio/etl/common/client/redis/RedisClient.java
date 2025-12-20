@@ -1,23 +1,28 @@
-package com.zhugeio.etl.common.client.kvrocks;
+package com.zhugeio.etl.common.client.redis;
 
 import io.lettuce.core.*;
 import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.async.RedisAsyncCommands;
+import io.lettuce.core.api.sync.RedisCommands;
 import io.lettuce.core.cluster.ClusterClientOptions;
 import io.lettuce.core.cluster.RedisClusterClient;
 import io.lettuce.core.cluster.api.StatefulRedisClusterConnection;
 import io.lettuce.core.cluster.api.async.RedisAdvancedClusterAsyncCommands;
+import io.lettuce.core.cluster.api.sync.RedisAdvancedClusterCommands;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
 import java.time.Duration;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 /**
- * KVRocks客户端 - Lettuce真异步版本 + 分布式原子操作支持
+ * Redis客户端 - Lettuce真异步版本 + 分布式原子操作支持
  *
  * ✅ 优势:
  * 1. 真正的异步IO,基于Netty
@@ -25,9 +30,9 @@ import java.util.stream.Collectors;
  * 3. 支持百万级并发
  * 4. ✅ 新增: SETNX/HSETNX 原子操作,解决分布式并发问题
  */
-public class KvrocksClient implements Serializable {
+public class RedisClient implements Serializable {
 
-    private static final Logger LOG = LoggerFactory.getLogger(KvrocksClient.class);
+    private static final Logger LOG = LoggerFactory.getLogger(RedisClient.class);
     private static final long serialVersionUID = 1L;
 
     private final String host;
@@ -36,11 +41,11 @@ public class KvrocksClient implements Serializable {
 
     // Lettuce客户端 (transient, 在每个TaskManager上重新初始化)
     private transient RedisClusterClient clusterClient;
-    private transient RedisClient standaloneClient;
+    private transient io.lettuce.core.RedisClient standaloneClient;
     private transient StatefulRedisClusterConnection<String, String> clusterConnection;
     private transient StatefulRedisConnection<String, String> standaloneConnection;
 
-    public KvrocksClient(String host, int port, boolean isCluster) {
+    public RedisClient(String host, int port, boolean isCluster) {
         this.host = host;
         this.port = port;
         this.isCluster = isCluster;
@@ -48,7 +53,7 @@ public class KvrocksClient implements Serializable {
 
     // 使用静态连接池，所有算子共享
     private static volatile RedisClusterClient sharedClusterClient;
-    private static volatile RedisClient sharedStandaloneClient;
+    private static volatile io.lettuce.core.RedisClient sharedStandaloneClient;
     private static final Object LOCK = new Object();
 
     /**
@@ -78,7 +83,7 @@ public class KvrocksClient implements Serializable {
             clusterConnection = sharedClusterClient.connect();
         } else {
             // 单机模式
-            standaloneClient = RedisClient.create(
+            standaloneClient = io.lettuce.core.RedisClient.create(
                     RedisURI.Builder
                             .redis(host, port)
                             .withTimeout(Duration.ofSeconds(60))
@@ -126,6 +131,116 @@ public class KvrocksClient implements Serializable {
         }
     }
 
+
+    /**
+     * ✅ 真正的异步Get操作 (基于Netty,无阻塞)
+     * List<KeyValue<String, String>> 返回数量和入参一致， 顺序一致，若不存在value为null
+     */
+    public CompletableFuture<List<KeyValue<String, String>>> asyncMGet(String...keys) {
+        try {
+            if (isCluster) {
+                RedisAdvancedClusterAsyncCommands<String, String> async =
+                        clusterConnection.async();
+                return async.mget(keys)
+                        .toCompletableFuture()
+                        .exceptionally(ex -> {
+                            LOG.error("集群版 MGET失败: {}, {}", keys, ex.getMessage());
+                            throw new RuntimeException("集群版 MGET失败", ex);
+                        });
+            } else {
+                RedisAsyncCommands<String, String> async =
+                        standaloneConnection.async();
+                return async.mget(keys)
+                        .toCompletableFuture()
+                        .exceptionally(ex -> {
+                            LOG.error("单机版 MGET失败: {}, {}", keys, ex.getMessage());
+                            throw new RuntimeException("单机版 MGET失败", ex);
+                        });
+            }
+        } catch (Exception e) {
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    /**
+     * ✅ 真正的异步Get操作 (基于Netty,无阻塞)
+     * List<KeyValue<String, String>> 返回数量和入参一致， 顺序一致，若不存在value为null
+     */
+    public List<KeyValue<String, String>> syncMGet(String...keys) {
+        if (isCluster) {
+            RedisAdvancedClusterCommands<String, String> async =
+                    clusterConnection.sync();
+            return async.mget(keys);
+
+        } else {
+            RedisCommands<String, String> async =
+                    standaloneConnection.sync();
+            return async.mget(keys);
+        }
+    }
+
+    /**
+     * ✅ 真正的异步Get操作 (基于Netty,无阻塞)
+     * List<KeyValue<String, String>> 返回数量和入参一致， 顺序一致，若不存在value为null
+     */
+    public String syncGet(String keys) {
+        if (isCluster) {
+            RedisAdvancedClusterCommands<String, String> async =
+                    clusterConnection.sync();
+            return async.get(keys);
+
+        } else {
+            RedisCommands<String, String> async =
+                    standaloneConnection.sync();
+            return async.get(keys);
+        }
+    }
+
+    /**
+     * ✅ 真正的异步del操作 (基于Netty,无阻塞)
+     */
+    public CompletableFuture<Long> asyncDel(String...keys) {
+        try {
+            if (isCluster) {
+                RedisAdvancedClusterAsyncCommands<String, String> async =
+                        clusterConnection.async();
+                return async.del(keys)
+                        .toCompletableFuture()
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks DEL失败: {}, {}", keys, ex.getMessage());
+                            throw new RuntimeException("KVRocks GET失败", ex);
+                        });
+            } else {
+                RedisAsyncCommands<String, String> async =
+                        standaloneConnection.async();
+                return async.del(keys)
+                        .toCompletableFuture()
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks GET失败: {}, {}", keys, ex.getMessage());
+                            throw new RuntimeException("KVRocks GET失败", ex);
+                        });
+            }
+        } catch (Exception e) {
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    public Long syncDel(String...keys) {
+        try {
+            if (isCluster) {
+                RedisAdvancedClusterCommands<String, String> async =
+                        clusterConnection.sync();
+                return async.del(keys);
+            } else {
+                RedisCommands<String, String> async =
+                        standaloneConnection.sync();
+                return async.del(keys);
+            }
+        } catch (Exception e) {
+            return -1L;
+        }
+    }
+
     /**
      * ✅ 真正的异步Set操作 (修复类型转换)
      */
@@ -157,34 +272,27 @@ public class KvrocksClient implements Serializable {
         }
     }
 
-    /**
-     * ✅ 异步 SETEX (带过期时间的SET)
-     */
-    public CompletableFuture<Void> asyncSetEx(String key, long seconds, String value) {
-        try {
-            if (isCluster) {
-                RedisAdvancedClusterAsyncCommands<String, String> async =
-                        clusterConnection.async();
-                return async.setex(key, seconds, value)
-                        .toCompletableFuture()
-                        .thenApply(result -> (Void) null)
-                        .exceptionally(ex -> {
-                            LOG.error("KVRocks SETEX失败: {}, {}", key, ex.getMessage());
-                            return null;
-                        });
-            } else {
-                RedisAsyncCommands<String, String> async =
-                        standaloneConnection.async();
-                return async.setex(key, seconds, value)
-                        .toCompletableFuture()
-                        .thenApply(result -> (Void) null)
-                        .exceptionally(ex -> {
-                            LOG.error("KVRocks SETEX失败: {}, {}", key, ex.getMessage());
-                            return null;
-                        });
-            }
-        } catch (Exception e) {
-            return CompletableFuture.completedFuture(null);
+    public String syncSet(String key, String value) {
+        if (isCluster) {
+            RedisAdvancedClusterCommands<String, String> async =
+                    clusterConnection.sync();
+            return async.set(key, value);
+        } else {
+            RedisCommands<String, String> async =
+                    standaloneConnection.sync();
+            return async.set(key, value);
+        }
+    }
+
+    public Boolean expire(String key,long expire) {
+        if (isCluster) {
+            RedisAdvancedClusterCommands<String, String> async =
+                    clusterConnection.sync();
+            return async.expire(key, expire);
+        } else {
+            RedisCommands<String, String> async =
+                    standaloneConnection.sync();
+            return async.expire(key, expire);
         }
     }
 
@@ -240,6 +348,18 @@ public class KvrocksClient implements Serializable {
         }
     }
 
+    public String syncHGet(String key, String field) {
+        try {
+            if (isCluster) {
+                return clusterConnection.sync().hget(key, field);
+            } else {
+                return standaloneConnection.sync().hget(key, field);
+            }
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     /**
      * ✅ 异步Hash Set (修复类型转换)
      */
@@ -258,36 +378,6 @@ public class KvrocksClient implements Serializable {
             }
         } catch (Exception e) {
             return CompletableFuture.completedFuture(null);
-        }
-    }
-
-    /**
-     * ✅ 异步Hash GetAll
-     */
-    public CompletableFuture<Map<String, String>> asyncHGetAll(String key) {
-        try {
-            if (isCluster) {
-                RedisAdvancedClusterAsyncCommands<String, String> async = 
-                        clusterConnection.async();
-                return async.hgetall(key)
-                        .toCompletableFuture()
-                        .exceptionally(ex -> {
-                            LOG.error("KVRocks HGETALL失败: {}, {}", key, ex.getMessage());
-                            return new HashMap<>();
-                        });
-            } else {
-                RedisAsyncCommands<String, String> async = 
-                        standaloneConnection.async();
-                return async.hgetall(key)
-                        .toCompletableFuture()
-                        .exceptionally(ex -> {
-                            LOG.error("KVRocks HGETALL失败: {}, {}", key, ex.getMessage());
-                            return new HashMap<>();
-                        });
-            }
-        } catch (Exception e) {
-            LOG.error("KVRocks HGETALL异常: {}, {}", key, e.getMessage());
-            return CompletableFuture.completedFuture(new HashMap<>());
         }
     }
 
@@ -446,22 +536,6 @@ public class KvrocksClient implements Serializable {
     }
 
     /**
-     * ✅ 同步Hash Get
-     */
-    public String hGet(String key, String field) {
-        try {
-            if (isCluster) {
-                return clusterConnection.sync().hget(key, field);
-            } else {
-                return standaloneConnection.sync().hget(key, field);
-            }
-        } catch (Exception e) {
-            LOG.error("KVRocks HGET失败: {}:{}", key, field, e.getMessage());
-            return null;
-        }
-    }
-
-    /**
      * ✅ 同步批量管道查询 (Window算子专用)
      */
     public Map<String, String> syncBatchHGet(String hashKey, List<String> fields, long timeoutMs) {
@@ -576,83 +650,6 @@ public class KvrocksClient implements Serializable {
 
         } catch (Exception e) {
             LOG.error("批量写入失败: {}, {}", hashKey, e.getMessage());
-        }
-    }
-
-    // ==================== Set 操作 ====================
-
-    /**
-     * ✅ 异步 SISMEMBER (检查成员是否在集合中)
-     */
-    public CompletableFuture<Boolean> asyncSIsMember(String key, String member) {
-        try {
-            if (isCluster) {
-                return clusterConnection.async().sismember(key, member)
-                        .toCompletableFuture()
-                        .exceptionally(ex -> {
-                            LOG.error("KVRocks SISMEMBER失败: {}:{}, {}", key, member, ex.getMessage());
-                            return false;
-                        });
-            } else {
-                return standaloneConnection.async().sismember(key, member)
-                        .toCompletableFuture()
-                        .exceptionally(ex -> {
-                            LOG.error("KVRocks SISMEMBER失败: {}:{}, {}", key, member, ex.getMessage());
-                            return false;
-                        });
-            }
-        } catch (Exception e) {
-            return CompletableFuture.completedFuture(false);
-        }
-    }
-
-    /**
-     * ✅ 异步 SADD (添加成员到集合)
-     */
-    public CompletableFuture<Long> asyncSAdd(String key, String... members) {
-        try {
-            if (isCluster) {
-                return clusterConnection.async().sadd(key, members)
-                        .toCompletableFuture()
-                        .exceptionally(ex -> {
-                            LOG.error("KVRocks SADD失败: {}, {}", key, ex.getMessage());
-                            return 0L;
-                        });
-            } else {
-                return standaloneConnection.async().sadd(key, members)
-                        .toCompletableFuture()
-                        .exceptionally(ex -> {
-                            LOG.error("KVRocks SADD失败: {}, {}", key, ex.getMessage());
-                            return 0L;
-                        });
-            }
-        } catch (Exception e) {
-            return CompletableFuture.completedFuture(0L);
-        }
-    }
-
-    /**
-     * ✅ 异步 SMEMBERS (获取集合所有成员)
-     */
-    public CompletableFuture<Set<String>> asyncSMembers(String key) {
-        try {
-            if (isCluster) {
-                return clusterConnection.async().smembers(key)
-                        .toCompletableFuture()
-                        .exceptionally(ex -> {
-                            LOG.error("KVRocks SMEMBERS失败: {}, {}", key, ex.getMessage());
-                            return Collections.emptySet();
-                        });
-            } else {
-                return standaloneConnection.async().smembers(key)
-                        .toCompletableFuture()
-                        .exceptionally(ex -> {
-                            LOG.error("KVRocks SMEMBERS失败: {}, {}", key, ex.getMessage());
-                            return Collections.emptySet();
-                        });
-            }
-        } catch (Exception e) {
-            return CompletableFuture.completedFuture(Collections.emptySet());
         }
     }
 
